@@ -135,6 +135,7 @@ def print_op_context(target: Value, hint: str):
 
 tiling_level_2 = [64, 128, 0]
 tiling_level_1 = [16, 4, 0]
+reduce_tile = [0, 0, 8]
 
 
 @builtin.module(attrs={"transform.with_named_sequence": UnitAttr.get()})
@@ -176,7 +177,6 @@ def mod_transform():
             ),
         }
 
-        reduce_tile = [0, 0, 8]
         block_mapping = Attribute.parse("[ #gpu.block<y>, #gpu.block<x> ]")
         thread_mapping = Attribute.parse("[ #gpu.thread<y>, #gpu.thread<x> ]")
 
@@ -298,6 +298,17 @@ def mod_transform():
         # with print_op_context(match(module_op, ["gpu.func"]), "vectorize children"):
         structured.VectorizeChildrenAndApplyPatternsOp(match(module_op, ["gpu.func"]))
 
+        # fix by https://github.com/iree-org/iree/pull/15192/
+        @apply_patterns(match(module_op, ["gpu.func"]))
+        def pats():
+            transform.memref.ApplyFoldMemrefAliasOpsPatternsOp()
+
+        transform.ApplyCommonSubexpressionEliminationOp(match(module_op, ["gpu.func"]))
+
+        structured.HoistRedundantVectorTransfersOp(
+            any_op_t(), match(module_op, ["gpu.func"])
+        )
+
         with print_op_context(match(module_op, ["gpu.func"]), "lowering contraction"):
 
             @apply_patterns(match(module_op, ["gpu.func"]))
@@ -417,13 +428,14 @@ def build_cuda_func(compiled_module, kernel_name="naive"):
 def prepare_kernel(module, M, K, N):
     npy_dtype = np.float32
     cuda_func = build_cuda_func(module, "gemm_kernel")
-    shared_mem = (128 * 64 + 128 * 8 + 8 * 64) * npy_dtype().nbytes
     grid_dims = (math.ceil(N / tiling_level_2[1]), math.ceil(M / tiling_level_2[0]))
     block_dims = (
         math.ceil(tiling_level_2[1] / tiling_level_1[1]),  # x
         math.ceil(tiling_level_2[0] / tiling_level_1[0]),  # y
     )
-    shared_mem = (128 * 64 + 128 * 8 + 8 * 64) * npy_dtype().nbytes
+    shared_mem = (
+        tiling_level_2[0] * reduce_tile[2] + reduce_tile[2] * tiling_level_2[1]
+    ) * npy_dtype().nbytes
     return cuda_func, grid_dims, block_dims, shared_mem, npy_dtype
 
 
