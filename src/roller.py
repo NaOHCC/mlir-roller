@@ -63,10 +63,15 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--profile", action="store_true", help="profile")
 
 
-ctx = RAIIMLIRContext()
-backend = LLVMJITBackend()
-module = ExplicitlyManagedModule()
+# class GEMMBuilder:
+#     def __init__(self, M: int, N: int, K: int, dtype):
+#         self.ctx = RAIIMLIRContext()
+#         self.backend = LLVMJITBackend()
+#         self.module = ExplicitlyManagedModule()
 
+
+ctx = RAIIMLIRContext()
+module = ExplicitlyManagedModule()
 
 generics = M, N, K, dtype = list(map(TypeVar, ["M", "N", "K", "dtype"]))
 
@@ -133,9 +138,11 @@ def print_op_context(target: Value, hint: str):
         transform.PrintOp(target=target, name=f"after {hint}")
 
 
-tiling_level_2 = [64, 128, 0]
-tiling_level_1 = [16, 4, 0]
-reduce_tile = [0, 0, 8]
+block_tile = [64, 128, 0]
+# warp_tile = [32, 64, 0]
+thread_tile = [16, 4, 0]
+reduce_tile = [0, 0, 32]
+pipeline_depth = 2
 
 
 @builtin.module(attrs={"transform.with_named_sequence": UnitAttr.get()})
@@ -148,7 +155,7 @@ def mod_transform():
         # reg_space_str = "#gpu.address_space<private>"
         smem_space = ArrayAttr.get([Attribute.parse(smem_space_str)])
         local_space = ArrayAttr.get([Attribute.parse(local_space_str)])
-        block_dims = get_block_dims(tiling_level_2, tiling_level_1)
+        block_dims = get_block_dims(block_tile, thread_tile)
         CopyToWorkgroupMemoryMarker = {
             "key": "__internal_linalg_transform__",
             "value": StringAttr.get("copy_to_workgroup_memory"),
@@ -177,8 +184,8 @@ def mod_transform():
             ),
         }
 
-        block_mapping = Attribute.parse("[ #gpu.block<y>, #gpu.block<x> ]")
-        thread_mapping = Attribute.parse("[ #gpu.thread<y>, #gpu.thread<x> ]")
+        block_mapping_attr = Attribute.parse("[ #gpu.block<y>, #gpu.block<x> ]")
+        thread_mapping_attr = Attribute.parse("[ #gpu.thread<y>, #gpu.thread<x> ]")
 
         matmul = match(module_op, ops=["linalg.matmul"])
 
@@ -187,9 +194,8 @@ def mod_transform():
                 # transform.OperationType.get("linalg.generic"),  # tiled_op_type
                 # transform.OperationType.get("scf.forall"),  # loops_type
                 matmul,
-                # num_threads=[2, 4, 4],
-                tile_sizes=tiling_level_2,
-                mapping=block_mapping,
+                tile_sizes=block_tile,
+                mapping=block_mapping_attr,
             )
 
         with print_op_context(module_op, "map forall to blocks"):
@@ -198,26 +204,11 @@ def mod_transform():
             )
             clean(module_op, "gpu.func")
 
-        # with print_op_context(module_op, "promote C"):
-        #     promoted = structured.PromoteOp(
-        #         transformed=any_op_t(),
-        #         target=match(module_op, ["linalg.matmul"]),
-        #         operands_to_promote=[2],
-        #         mapping=smem_space,
-        #         use_alloca=False,
-        #     )
-
         with print_op_context(module_op, "tile k"):
             redution_tiled = structured.TileUsingForOp(
                 match(module_op, ["linalg.matmul"]),
                 sizes=reduce_tile,
-                # num_threads=reduce_tile
             )
-            # redution_tiled = structured.TileReductionUsingForOp(
-            #     match(module_op, ["linalg.matmul"]),
-            #     sizes=reduce_tile,
-            #     # num_threads=reduce_tile
-            # )
 
             iree_transform.AddAttrbuiteOp([redution_tiled.loops[0]], **PipelineMarker)
 
@@ -236,27 +227,26 @@ def mod_transform():
                 match(module_op, ops=["scf.forall"]),  # loops_type
                 match(module_op, ops=["linalg.matmul"]),
                 # num_threads=[2, 4, 4],
-                tile_sizes=tiling_level_1,
-                mapping=thread_mapping,
+                tile_sizes=thread_tile,
+                mapping=thread_mapping_attr,
             )
 
         # mark copy to workgroup memory
         memref_copy = match(module_op, ops=["memref.copy"])
         iree_transform.AddAttrbuiteOp([memref_copy], **CopyToWorkgroupMemoryMarker)
 
-        # with print_op_context(module_op, "promote C"):
-        #     promoted = structured.PromoteOp(
-        #         transformed=any_op_t(),
-        #         target=match(module_op, ["linalg.matmul"]),
-        #         operands_to_promote=[2],
-        #         # mapping=local_space,
-        #         use_alloca=True,
-        #     )
-
         # map gpu hierarchy
+        clean(module_op, "func.func")
+        transform.ApplyRegisteredPassOp(
+            any_op_t(),
+            match(module_op, ["func.func"]),
+            "iree-codegen-gpu-multi-buffering",
+            options=f"num-buffers={pipeline_depth}",
+        )
+
         with print_op_context(module_op, "map nested forall to threads"):
             gpu_launch_op = gpu_transform.MapNestedForallToThreads(
-                gpu_launch_op.result, block_dims=block_dims
+                match(module_op, ops=["gpu.launch"]), block_dims=block_dims
             )
             transform.ApplyRegisteredPassOp(
                 any_op_t(),
@@ -292,7 +282,7 @@ def mod_transform():
             clean(module_op, "gpu.func")
 
         # reduce bank conflicts
-        iree_transform.ReduceSharedMemoryBankConflictsOp(match(module_op, ["gpu.func"]))
+        # iree_transform.ReduceSharedMemoryBankConflictsOp(match(module_op, ["gpu.func"]))
 
         # vectorize children
         # with print_op_context(match(module_op, ["gpu.func"]), "vectorize children"):
@@ -309,6 +299,31 @@ def mod_transform():
             any_op_t(), match(module_op, ["gpu.func"])
         )
 
+        with print_op_context(module_op, "pipeline"):
+
+            @apply_patterns(match(module_op, ["gpu.func"]))
+            def pats():
+                vector.ApplyCastAwayVectorLeadingOneDimPatternsOp()
+
+            iree_transform.CreateAsyncGroupsOp(
+                match(module_op, ["gpu.func"]), use_mma_sync=True
+            )
+
+            transform.ApplyRegisteredPassOp(
+                any_op_t(),
+                match(module_op, ["gpu.func"]),
+                "iree-codegen-gpu-pipelining",
+                options=f"pipeline-depth={pipeline_depth}",
+            )
+        clean(module_op, "gpu.func")
+
+        @apply_patterns(match(module_op, ["gpu.func"]))
+        def pats():
+            transform.memref.ApplyFoldMemrefAliasOpsPatternsOp()
+
+        transform.ApplyCommonSubexpressionEliminationOp(match(module_op, ["gpu.func"]))
+
+        clean(module_op, "gpu.func")
         with print_op_context(match(module_op, ["gpu.func"]), "lowering contraction"):
 
             @apply_patterns(match(module_op, ["gpu.func"]))
@@ -329,15 +344,51 @@ def mod_transform():
                 # )
                 # vector.ApplyLowerTransferPatternsOp(max_transfer_rank=1)
                 # vector.ApplyLowerShapeCastPatternsOp()
-                # vector.ApplyLowerTransposePatternsOp(
-                #     lowering_strategy=VectorTransposeLowering.Shuffle1D
-                # )
+                vector.ApplyLowerTransposePatternsOp(
+                    lowering_strategy=VectorTransposeLowering.Shuffle1D
+                )
 
         all_loops = match(
             module_op, interface=structured.MatchInterfaceEnum.LoopLikeInterface
         )
         transform.apply_licm(all_loops)
-        # clean(module_op, "gpu.func")
+
+        clean(module_op, "gpu.func")
+        # transform.ApplyRegisteredPassOp(
+        #     any_op_t(), match(module_op, ["gpu.func"]), "iree-llvmgpu-vector-lowering"
+        # )
+        # transform.ApplyRegisteredPassOp(
+        #     any_op_t(),
+        #     match(module_op, ["gpu.func"]),
+        #     "nvgpu-optimize-shared-memory",
+        # )
+
+        transform.ApplyRegisteredPassOp(
+            any_op_t(),
+            match(module_op, ["gpu.func"]),
+            "iree-llvmgpu-convert-static-shared-memory-alloc",
+        )
+
+        transform.ApplyRegisteredPassOp(
+            any_op_t(),
+            match(module_op, ["gpu.func"]),
+            "iree-llvmgpu-assume-argument-alignment",
+            options="alignment=128",
+        )
+
+        @apply_patterns(match(module_op, ["gpu.func"]))
+        def pats():
+            transform.memref.ApplyFoldMemrefAliasOpsPatternsOp()
+
+        transform.ApplyCommonSubexpressionEliminationOp(match(module_op, ["gpu.func"]))
+
+        transform.ApplyRegisteredPassOp(
+            any_op_t(),
+            match(module_op, ["gpu.func"]),
+            "iree-llvmgpu-thread-block-swizzle",
+            options="panel-width=4",
+        )
+        clean(module_op, "gpu.func")
 
         return
 
@@ -348,6 +399,7 @@ def run_transform(module):
         pipeline=Pipeline().transform_interpreter(
             entry_point="main", debug_payload_root_tag="payload"
         ),
+        enable_ir_printing=True,
     )
 
 
@@ -361,7 +413,7 @@ def lower_to_llvm(module, need_find: bool = True, enable_ir_printing: bool = Fal
         )
         .convert_linalg_to_loops()
         .convert_nvgpu_to_nvvm()
-        .gpu_kernel_outlining()
+        # .gpu_kernel_outlining()
         .convert_vector_to_scf()
         .convert_scf_to_cf()
         .convert_nvvm_to_llvm()
@@ -386,12 +438,13 @@ def lower_to_llvm(module, need_find: bool = True, enable_ir_printing: bool = Fal
             # TODO(max): upstream this (add to gpu pipeline)
             # vector.transfer
             .convert_vector_to_scf()
-            .convert_vector_to_llvm()
             .convert_gpu_to_nvvm(use_bare_ptr_memref_call_conv=True)
+            .convert_vector_to_llvm()
             .canonicalize()
             .cse()
             .reconcile_unrealized_casts()
         )
+        # .add_pass("iree-convert-to-nvvm")
         .gpu_to_llvm(use_bare_pointers_for_kernels=True)
         .gpu_module_to_binary(format="isa")
         .canonicalize()
@@ -428,14 +481,18 @@ def build_cuda_func(compiled_module, kernel_name="naive"):
 def prepare_kernel(module, M, K, N):
     npy_dtype = np.float32
     cuda_func = build_cuda_func(module, "gemm_kernel")
-    grid_dims = (math.ceil(N / tiling_level_2[1]), math.ceil(M / tiling_level_2[0]))
+    grid_dims = (math.ceil(N / block_tile[1]), math.ceil(M / block_tile[0]))
     block_dims = (
-        math.ceil(tiling_level_2[1] / tiling_level_1[1]),  # x
-        math.ceil(tiling_level_2[0] / tiling_level_1[0]),  # y
+        math.ceil(block_tile[1] / thread_tile[1]),  # x
+        math.ceil(block_tile[0] / thread_tile[0]),  # y
     )
     shared_mem = (
-        tiling_level_2[0] * reduce_tile[2] + reduce_tile[2] * tiling_level_2[1]
-    ) * npy_dtype().nbytes
+        (block_tile[0] * reduce_tile[2] + reduce_tile[2] * block_tile[1])
+        * npy_dtype().nbytes
+        * pipeline_depth
+    )
+    attr = cp.cuda.driver.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+    cp.cuda.driver.funcSetAttribute(cuda_func.ptr, attr, shared_mem)
     return cuda_func, grid_dims, block_dims, shared_mem, npy_dtype
 
 
@@ -481,7 +538,7 @@ def run_eval(
     if not np.array_equal(C, A @ B):
         print(A @ B)
         print(C)
-        # assert False
+    # assert False
     if profile:
         return
 
@@ -525,6 +582,7 @@ if __name__ == "__main__":
                 single=True,
             ).__str__()
         )
+    # exit(0)
     lowered_module = lower_to_llvm(transformed_module)
 
     with open("log/lower.mlir", "w") as f:
