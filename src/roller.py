@@ -139,9 +139,9 @@ def print_op_context(target: Value, hint: str):
 
 
 block_tile = [64, 128, 0]
-# warp_tile = [32, 64, 0]
+warp_tile = [32, 64, 0]
 thread_tile = [16, 4, 0]
-reduce_tile = [0, 0, 32]
+reduce_tile = [0, 0, 8]
 pipeline_depth = 2
 
 
@@ -185,7 +185,12 @@ def mod_transform():
         }
 
         block_mapping_attr = Attribute.parse("[ #gpu.block<y>, #gpu.block<x> ]")
-        thread_mapping_attr = Attribute.parse("[ #gpu.thread<y>, #gpu.thread<x> ]")
+        warp_mapping = Attribute.parse(
+            "[ #gpu.warp<linear_dim_1>, #gpu.warp<linear_dim_0> ]"
+        )
+        thread_mapping_attr = Attribute.parse(
+            "[ #gpu.lane<linear_dim_1>, #gpu.lane<linear_dim_0> ]"
+        )
 
         matmul = match(module_op, ops=["linalg.matmul"])
 
@@ -221,6 +226,16 @@ def mod_transform():
                 use_alloca=True,
             )
 
+        with print_op_context(module_op, "warp tile"):
+            warp_tile_op = structured.TileUsingForallOp(
+                match(module_op, ops=["linalg.matmul"]),  # tiled_op_type
+                match(module_op, ops=["scf.forall"]),  # loops_type
+                match(module_op, ops=["linalg.matmul"]),
+                # num_threads=[2, 4, 4],
+                tile_sizes=warp_tile,
+                mapping=warp_mapping,
+            )
+
         with print_op_context(module_op, "tile level 1"):
             level_1_op = structured.TileUsingForallOp(
                 match(module_op, ops=["linalg.matmul"]),  # tiled_op_type
@@ -230,7 +245,6 @@ def mod_transform():
                 tile_sizes=thread_tile,
                 mapping=thread_mapping_attr,
             )
-
         # mark copy to workgroup memory
         memref_copy = match(module_op, ops=["memref.copy"])
         iree_transform.AddAttrbuiteOp([memref_copy], **CopyToWorkgroupMemoryMarker)

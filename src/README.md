@@ -56,4 +56,41 @@ loop.LoopPipelineOp(
         ),
     ),
 )
+
+
+            # redution_tiled = structured.TileReductionUsingForOp(
+            #     match(module_op, ["linalg.matmul"]),
+            #     sizes=reduce_tile,
+            #     # num_threads=reduce_tile
+            # )
+```
+
+
+## warp and lane tile
+```python
+warp_mapping = Attribute.parse(
+    "[ #gpu.warp<linear_dim_1>, #gpu.warp<linear_dim_0> ]"
+)
+thread_mapping = Attribute.parse(
+    "[ #gpu.lane<linear_dim_1>, #gpu.lane<linear_dim_0> ]"
+)
+with print_op_context(module_op, "warp tile"):
+    warp_tile_op = structured.TileUsingForallOp(
+        match(module_op, ops=["linalg.matmul"]),  # tiled_op_type
+        match(module_op, ops=["scf.forall"]),  # loops_type
+        match(module_op, ops=["linalg.matmul"]),
+        # num_threads=[2, 4, 4],
+        tile_sizes=warp_tile,
+        mapping=warp_mapping,
+    )
+
+with print_op_context(module_op, "tile level 1"):
+    level_1_op = structured.TileUsingForallOp(
+        match(module_op, ops=["linalg.matmul"]),  # tiled_op_type
+        match(module_op, ops=["scf.forall"]),  # loops_type
+        match(module_op, ops=["linalg.matmul"]),
+        # num_threads=[2, 4, 4],
+        tile_sizes=tiling_level_1,
+        mapping=thread_mapping,
+    )
 ```
