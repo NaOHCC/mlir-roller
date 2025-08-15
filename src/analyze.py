@@ -279,6 +279,7 @@ class Policy:
     def score_block_size(self, n):
         """
         Scores a block size based on its efficiency and fit relative to the architecture's warp size and SM partition.
+        Small is better.
 
         Parameters
         ----------
@@ -290,9 +291,9 @@ class Policy:
         Tuple[float, float]
             A tuple containing two scores representing efficiency and fit, respectively.
         """
-        num_wrap = (n + self.arch.warp_size - 1) // self.arch.warp_size
-        r1 = max(num_wrap / self.arch.sm_partition, self.arch.sm_partition / num_wrap)
-        r2 = (num_wrap * self.arch.warp_size - n) / n
+        num_warp = (n + self.arch.warp_size - 1) // self.arch.warp_size
+        r1 = max(num_warp / self.arch.sm_partition, self.arch.sm_partition / num_warp)
+        r2 = (num_warp * self.arch.warp_size - n) / n
         return (r1, r2)
 
     def recommend_block_size(self, td: TileDict):
@@ -330,9 +331,11 @@ class Policy:
         Assigns a thread tile to a TileDict configuration.
         """
         block_tile = td.block_tile
-        factors = factorize(block_size)
-        cur_thread_tile = [1 for _ in block_tile]
-        ndim = len(block_tile)
+
+        def get_factor_pairs(n: int):
+            return [[n // i, i] for i in range(1, int(math.sqrt(n)) + 1) if n % i == 0]
+
+        possible_tile_size = get_factor_pairs(math.prod(block_tile) // block_size)
 
         def _score(thread_tile):  # small is better
             score = 0
@@ -341,33 +344,24 @@ class Policy:
             for shape in shapes:
                 score += math.prod(shape.to_list()) / self.arch.bandwidth[1]
 
-            # write
-            score += (
-                coalesced_tensor_shape(
-                    thread_tile,
-                    list(self.matmul_config.get_output_shape()),
-                    write_txn_elems(self.arch, self.matmul_config.el_bytes),
-                )
-                / self.arch.bandwidth[0]
-            )
+            # # write
+            # score += (
+            #     coalesced_tensor_shape(
+            #         thread_tile,
+            #         list(self.matmul_config.get_output_shape()),
+            #         write_txn_elems(self.arch, self.matmul_config.el_bytes),
+            #     )
+            #     / self.arch.bandwidth[0]
+            # )
             return score
 
-        # 扩展 thread tile
-        for factor in reversed(factors):
-            score_map = {}
-            for i in range(ndim):
-                if cur_thread_tile[i] >= block_tile[i]:
-                    continue
-                if (block_tile[i] % (cur_thread_tile[i] * factor)) != 0:
-                    continue
-                cur_thread_tile[i] *= factor
-                score_map[i] = (_score(cur_thread_tile), i)
-                cur_thread_tile[i] //= factor
+        sorted_possible_tile_size = sorted(possible_tile_size, key=_score)
+        best_tile = sorted_possible_tile_size[0]
+        reg_usage = int(math.prod(best_tile) * self.matmul_config.el_bytes / 4)
+        if reg_usage >= 256:
+            return None
 
-            dim_order = sorted(score_map.keys(), key=lambda x: score_map[x])
-            cur_thread_tile[dim_order[0]] *= factor
-
-        td.thread_tile = cur_thread_tile
+        td.thread_tile = best_tile
         return deepcopy(td)
 
     def emit_config(self, topk=10) -> list[TileDict]:
