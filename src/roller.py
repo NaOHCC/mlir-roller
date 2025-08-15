@@ -1,26 +1,19 @@
-import gc
 from typing import Optional, TypeVar
 
 from iree.compiler.ir import *
 import argparse
-import math
 from contextlib import contextmanager
 from pathlib import Path
 
 import cupy as cp
 import iree.compiler.extras.types as T
-import numpy as np
 from analyze import get_roller_hints, MatmulConfig, TileDict
 from arch import CUDA
 
 from iree.compiler.dialects import builtin, iree_codegen, iree_transform, scf, transform
-from iree.compiler.dialects.bufferization import LayoutMapOption
 from iree.compiler.dialects.transform import (
     any_op_t,
-    apply_licm,
-    bufferization,
     gpu as gpu_transform,
-    loop,
     structured,
     vector,
 )
@@ -31,28 +24,9 @@ from iree.compiler.dialects.transform.vector import (
     VectorTransferSplit,
     VectorTransposeLowering,
 )
-from iree.compiler.extras.ast.canonicalize import canonicalize
-from iree.compiler.extras.context import (
-    ExplicitlyManagedModule,
-    mlir_mod_ctx,
-    MLIRContext,
-    RAIIMLIRContext,
-    RAIIMLIRContextModule,
-)
-from iree.compiler.extras.dialects.ext import (
-    arith,
-    func,
-    gpu,
-    linalg,
-    memref,
-    transform as ext_transform,
-)
-from iree.compiler.extras.dialects.ext.gpu import (
-    block_dim,
-    block_idx,
-    get_compile_object_bytes,
-    thread_idx,
-)
+from iree.compiler.extras.context import mlir_mod_ctx
+from iree.compiler.extras.dialects.ext import func, linalg, memref
+from iree.compiler.extras.dialects.ext.gpu import get_compile_object_bytes
 from iree.compiler.extras.dialects.ext.memref import S
 from iree.compiler.extras.dialects.ext.transform import (
     get_parent_op,
@@ -61,7 +35,6 @@ from iree.compiler.extras.dialects.ext.transform import (
     transform_any_op_t,
 )
 from iree.compiler.extras.runtime.passes import Pipeline, run_pipeline
-from iree.compiler.extras.runtime.refbackend import LLVMJITBackend
 from iree.compiler.extras.util import enable_debug as enable_debug, find_ops
 from utils import get_block_dims
 
@@ -102,13 +75,12 @@ class GEMMBuilder:
     def get_i64_attr(self, val: int) -> IntegerAttr:
         return IntegerAttr.get(IntegerType.get_signless(64), val)
 
-    def clean(self, target, op_name="func.func"):
-        funcOp = structured.MatchOp.match_op_names(target, op_name)
-        with InsertionPoint(transform.ApplyPatternsOp(funcOp).patterns):
+    def clean(self, target):
+        with InsertionPoint(transform.ApplyPatternsOp(target).patterns):
             transform.ApplyCanonicalizationPatternsOp()
             structured.ApplyTilingCanonicalizationPatternsOp()
 
-        transform.ApplyCommonSubexpressionEliminationOp(funcOp)
+        transform.ApplyCommonSubexpressionEliminationOp(target)
 
     @contextmanager
     def print_op_context(self, target: Value, hint: str):
@@ -135,20 +107,15 @@ class GEMMBuilder:
         def mod_transform():
             @named_sequence("main", [any_op_t()], [])
             def main(module_op: any_op_t()):
+                # prepare attrs
                 smem_space_str = "#gpu.memory_space<workgroup>"  # HACK: what different between memory_space and address_space?
-                local_space_str = "#gpu.memory_space<private>"
                 # smem_space_str = "#gpu.address_space<workgroup>"
-                # reg_space_str = "#gpu.address_space<private>"
+
                 smem_space = ArrayAttr.get([Attribute.parse(smem_space_str)])
-                local_space = ArrayAttr.get([Attribute.parse(local_space_str)])
                 block_dims = get_block_dims(block_tile, thread_tile)
                 CopyToWorkgroupMemoryMarker = {
                     "key": "__internal_linalg_transform__",
                     "value": StringAttr.get("copy_to_workgroup_memory"),
-                }
-                PipelineMarker = {
-                    "key": "__my_pipeline__",
-                    "value": StringAttr.get("__my_pipeline__"),
                 }
 
                 pipeline_attr = iree_codegen.DispatchLoweringPassPipelineAttr.get(
@@ -176,6 +143,7 @@ class GEMMBuilder:
                 )
 
                 matmul = match(module_op, ops=["linalg.matmul"])
+                funcOp = match(module_op, ops=["func.func"])
 
                 with self.print_op_context(module_op, "tile level 2"):
                     level_2_op = structured.TileUsingForallOp(
@@ -186,22 +154,16 @@ class GEMMBuilder:
                         mapping=block_mapping_attr,
                     )
 
-                with self.print_op_context(module_op, "map forall to blocks"):
-                    gpu_launch_op = gpu_transform.MapForallToBlocks(
-                        match(module_op, ops=["func.func"]), generate_gpu_launch=True
-                    )
-                    self.clean(module_op, "gpu.func")
-
                 with self.print_op_context(module_op, "tile k"):
                     redution_tiled = structured.TileUsingForOp(
-                        match(module_op, ["linalg.matmul"]),
+                        # match(module_op, ["linalg.matmul"]),
+                        level_2_op.tiled_op,
                         sizes=reduce_tile,
                     )
 
-                    iree_transform.AddAttrbuiteOp(
-                        [redution_tiled.loops[0]], **PipelineMarker
-                    )
-
+                    # iree_transform.AddAttrbuiteOp(
+                    #     [redution_tiled.loops[0]], **PipelineMarker
+                    # )
                 with self.print_op_context(module_op, "promote A and B"):
                     input_promoted = structured.PromoteOp(
                         transformed=transform.AnyOpType.get(),
@@ -210,12 +172,12 @@ class GEMMBuilder:
                         mapping=smem_space,
                         use_alloca=True,
                     )
-
                 with self.print_op_context(module_op, "tile level 1"):
                     level_1_op = structured.TileUsingForallOp(
-                        match(module_op, ops=["linalg.matmul"]),  # tiled_op_type
-                        match(module_op, ops=["scf.forall"]),  # loops_type
-                        match(module_op, ops=["linalg.matmul"]),
+                        # match(module_op, ops=["linalg.matmul"]),  # tiled_op_type
+                        # match(module_op, ops=["scf.forall"]),  # loops_type
+                        # match(module_op, ops=["linalg.matmul"]),
+                        input_promoted.transformed,
                         # num_threads=[2, 4, 4],
                         tile_sizes=thread_tile,
                         mapping=thread_mapping_attr,
@@ -228,110 +190,97 @@ class GEMMBuilder:
                 )
 
                 # map gpu hierarchy
-                self.clean(module_op, "func.func")
-                transform.ApplyRegisteredPassOp(
-                    any_op_t(),
-                    match(module_op, ["func.func"]),
-                    "iree-codegen-gpu-multi-buffering",
-                    options=f"num-buffers={pipeline_depth}",
-                )
-
-                with self.print_op_context(module_op, "map nested forall to threads"):
+                with self.print_op_context(module_op, "map forall to blocks"):
+                    gpu_launch_op = gpu_transform.MapForallToBlocks(
+                        level_2_op.forall_op, generate_gpu_launch=True
+                    )
                     gpu_launch_op = gpu_transform.MapNestedForallToThreads(
                         match(module_op, ops=["gpu.launch"]), block_dims=block_dims
                     )
-                    transform.ApplyRegisteredPassOp(
-                        any_op_t(),
-                        match(module_op, ops=["func.func"]),
-                        "iree-codegen-memrefcopy-to-linalg",
-                    )
-                    self.clean(module_op, "gpu.func")
+
+                self.clean(funcOp)  # required
+                funcOp = transform.ApplyRegisteredPassOp(
+                    any_op_t(),
+                    funcOp,
+                    "iree-codegen-gpu-multi-buffering",
+                    options=f"num-buffers={pipeline_depth}",
+                ).result
+                funcOp = transform.ApplyRegisteredPassOp(
+                    any_op_t(),
+                    funcOp,
+                    "iree-codegen-memrefcopy-to-linalg",
+                ).result
 
                 with self.print_op_context(
                     module_op, "gpu-launch-sink-index-computations"
                 ):
-                    sunk = transform.ApplyRegisteredPassOp(
+                    funcOp = transform.ApplyRegisteredPassOp(
                         any_op_t(),
-                        match(module_op, ["func.func"]),
+                        funcOp,
                         "gpu-launch-sink-index-computations",
-                    )
+                    ).result
 
                 # gpu-kernel-outlining
                 # with self.print_op_context(module_op, "gpu-kernel-outlining"):
-                outlined = transform.ApplyRegisteredPassOp(
+                module_op = transform.ApplyRegisteredPassOp(
                     any_op_t(), module_op, "gpu-kernel-outlining"
-                )
-                module_op = outlined.result
-                self.clean(module_op, "gpu.func")
+                ).result
 
+                gpuFuncOp = match(module_op, ops=["gpu.func"])
                 # DistributeSharedMemoryCopy
                 with self.print_op_context(module_op, "distribute shared memory copy"):
-                    gpu_module = match(module_op, ["gpu.module"])
-                    iree_transform.AddAttrbuiteOp(
-                        [match(module_op, ["gpu.func"])], **TranslationInfo
-                    )
-                    iree_transform.GpuDistributeSharedMemoryCopyOp(
-                        match(module_op, ["gpu.func"])
-                    )
-                    self.clean(module_op, "gpu.func")
+                    iree_transform.AddAttrbuiteOp([gpuFuncOp], **TranslationInfo)
+                    iree_transform.GpuDistributeSharedMemoryCopyOp(gpuFuncOp)
+                    self.clean(gpuFuncOp)
 
                 # reduce bank conflicts
                 # iree_transform.ReduceSharedMemoryBankConflictsOp(match(module_op, ["gpu.func"]))
 
                 # vectorize children
                 # with self.print_op_context(match(module_op, ["gpu.func"]), "vectorize children"):
-                structured.VectorizeChildrenAndApplyPatternsOp(
-                    match(module_op, ["gpu.func"])
-                )
+                gpuFuncOp = structured.VectorizeChildrenAndApplyPatternsOp(
+                    gpuFuncOp
+                ).transformed
 
                 # fix by https://github.com/iree-org/iree/pull/15192/
-                @apply_patterns(match(module_op, ["gpu.func"]))
+                @apply_patterns(gpuFuncOp)
                 def pats():
                     transform.memref.ApplyFoldMemrefAliasOpsPatternsOp()
 
-                transform.ApplyCommonSubexpressionEliminationOp(
-                    match(module_op, ["gpu.func"])
-                )
+                transform.ApplyCommonSubexpressionEliminationOp(gpuFuncOp)
 
-                structured.HoistRedundantVectorTransfersOp(
-                    any_op_t(), match(module_op, ["gpu.func"])
-                )
+                gpuFuncOp = structured.HoistRedundantVectorTransfersOp(
+                    any_op_t(), gpuFuncOp
+                ).transformed
 
                 with self.print_op_context(module_op, "pipeline"):
 
-                    @apply_patterns(match(module_op, ["gpu.func"]))
+                    @apply_patterns(gpuFuncOp)
                     def pats():
                         vector.ApplyCastAwayVectorLeadingOneDimPatternsOp()
 
-                    iree_transform.CreateAsyncGroupsOp(
-                        match(module_op, ["gpu.func"]), use_mma_sync=True
-                    )
-
-                    transform.ApplyRegisteredPassOp(
+                    iree_transform.CreateAsyncGroupsOp(gpuFuncOp, use_mma_sync=True)
+                    gpuFuncOp = transform.ApplyRegisteredPassOp(
                         any_op_t(),
-                        match(module_op, ["gpu.func"]),
+                        gpuFuncOp,
                         "iree-codegen-gpu-pipelining",
                         options=f"pipeline-depth={pipeline_depth}",
-                    )
-                self.clean(module_op, "gpu.func")
+                    ).result
+                self.clean(gpuFuncOp)
 
-                @apply_patterns(match(module_op, ["gpu.func"]))
+                @apply_patterns(gpuFuncOp)
                 def pats():
                     transform.memref.ApplyFoldMemrefAliasOpsPatternsOp()
 
-                transform.ApplyCommonSubexpressionEliminationOp(
-                    match(module_op, ["gpu.func"])
-                )
+                transform.ApplyCommonSubexpressionEliminationOp(gpuFuncOp)
 
-                self.clean(module_op, "gpu.func")
-                with self.print_op_context(
-                    match(module_op, ["gpu.func"]), "lowering contraction"
-                ):
+                self.clean(gpuFuncOp)
+                with self.print_op_context(gpuFuncOp, "lowering contraction"):
 
-                    @apply_patterns(match(module_op, ["gpu.func"]))
+                    @apply_patterns(gpuFuncOp)
                     def pats():
                         vector.ApplyLowerContractionPatternsOp(
-                            lowering_strategy=vector.VectorContractLowering.OuterProduct
+                            lowering_strategy=VectorContractLowering.OuterProduct
                         )
                         vector.ApplyTransferPermutationPatternsOp()
                         vector.ApplyLowerMultiReductionPatternsOp(
@@ -355,7 +304,7 @@ class GEMMBuilder:
                 )
                 transform.apply_licm(all_loops)
 
-                self.clean(module_op, "gpu.func")
+                self.clean(gpuFuncOp)
                 # transform.ApplyRegisteredPassOp(
                 #     any_op_t(), match(module_op, ["gpu.func"]), "iree-llvmgpu-vector-lowering"
                 # )
@@ -365,34 +314,32 @@ class GEMMBuilder:
                 #     "nvgpu-optimize-shared-memory",
                 # )
 
-                transform.ApplyRegisteredPassOp(
+                gpuFuncOp = transform.ApplyRegisteredPassOp(
                     any_op_t(),
-                    match(module_op, ["gpu.func"]),
+                    gpuFuncOp,
                     "iree-llvmgpu-convert-static-shared-memory-alloc",
-                )
+                ).result
 
-                transform.ApplyRegisteredPassOp(
+                gpuFuncOp = transform.ApplyRegisteredPassOp(
                     any_op_t(),
-                    match(module_op, ["gpu.func"]),
+                    gpuFuncOp,
                     "iree-llvmgpu-assume-argument-alignment",
                     options="alignment=128",
-                )
+                ).result
 
-                @apply_patterns(match(module_op, ["gpu.func"]))
+                @apply_patterns(gpuFuncOp)
                 def pats():
                     transform.memref.ApplyFoldMemrefAliasOpsPatternsOp()
 
-                transform.ApplyCommonSubexpressionEliminationOp(
-                    match(module_op, ["gpu.func"])
-                )
+                transform.ApplyCommonSubexpressionEliminationOp(gpuFuncOp)
 
-                transform.ApplyRegisteredPassOp(
+                gpuFuncOp = transform.ApplyRegisteredPassOp(
                     any_op_t(),
-                    match(module_op, ["gpu.func"]),
+                    gpuFuncOp,
                     "iree-llvmgpu-thread-block-swizzle",
-                    options="panel-width=4",
-                )
-                self.clean(module_op, "gpu.func")
+                    options="panel-width=8",
+                ).result
+                self.clean(gpuFuncOp)
 
                 return
 
@@ -536,7 +483,7 @@ def run_eval(
     cuda_func,
     pipeline_depth,
     hint: TileDict,
-    repeat_times=50,
+    repeat_times=20,
     profile=False,
 ) -> float:
     M, N, K = hint.matmul_config.M, hint.matmul_config.N, hint.matmul_config.K
