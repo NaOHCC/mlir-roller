@@ -1,0 +1,6 @@
+[submodule "third_party/iree"]
+	path = third_party/iree
+	url = https://github.com/NaOHCC/iree.git
+[submodule "third_party/mlir-python-extras"]
+	path = third_party/mlir-python-extras
+	url = https://github.com/makslevental/mlir-python-extras.git
