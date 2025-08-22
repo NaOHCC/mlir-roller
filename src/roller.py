@@ -1,7 +1,6 @@
 from typing import Optional, TypeVar
 
 from iree.compiler.ir import *
-import argparse
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -37,9 +36,6 @@ from iree.compiler.extras.dialects.ext.transform import (
 from iree.compiler.extras.runtime.passes import Pipeline, run_pipeline
 from iree.compiler.extras.util import enable_debug as enable_debug, find_ops
 from utils import get_block_dims
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--profile", action="store_true", help="profile")
 
 
 class GEMMBuilder:
@@ -484,8 +480,7 @@ def run_eval(
     pipeline_depth,
     hint: TileDict,
     repeat_times=20,
-    profile=False,
-) -> float:
+):
     M, N, K = hint.matmul_config.M, hint.matmul_config.N, hint.matmul_config.K
     dA = cp.random.rand(M, K, dtype=cp.float32)
     dB = cp.random.rand(K, N, dtype=cp.float32)
@@ -558,7 +553,6 @@ def run_baseline(config: MatmulConfig, repeat_times=50):
 
 
 if __name__ == "__main__":
-    args = parser.parse_args()
     S = 4096
     config = MatmulConfig(M=S, N=S, K=S, el_bits=32)
     pipeline_depth = 2
@@ -588,7 +582,6 @@ if __name__ == "__main__":
             cuda_func,
             pipeline_depth,
             hint,
-            profile=args.profile,
         )
         print("---\n")
         result_dict[hint] = t
