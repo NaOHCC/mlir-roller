@@ -9,6 +9,8 @@ import iree.compiler.extras.types as T
 from analyze import get_roller_hints, MatmulConfig, TileDict
 from arch import CUDA
 
+from cupyx.profiler import time_range
+
 from iree.compiler.dialects import builtin, iree_codegen, iree_transform, scf, transform
 from iree.compiler.dialects.transform import (
     any_op_t,
@@ -340,6 +342,51 @@ class GEMMBuilder:
                 return
 
 
+class Compiler:
+    def __init__(
+        self,
+        config: MatmulConfig,
+        hint: TileDict,
+        pipeline_depth: int = 2,
+        dump_path: Optional[Path] = None,
+    ):
+        self.config = config
+        self.hint = hint
+        self.pipeline_depth = pipeline_depth
+        self.dump_path = dump_path
+
+    def compile(self) -> "cp.cuda.Function":
+        with mlir_mod_ctx() as ctx:
+            gb = GEMMBuilder()
+            gb.build_gemm(self.config.M, self.config.N, self.config.K)
+            gb.build_transform_pipeline(
+                self.hint.block_tile,
+                self.hint.thread_tile,
+                self.hint.rstep,
+                self.pipeline_depth,
+            )
+            module = ctx.module
+            if self.dump_path:
+                dump_transformed_path = self.dump_path / "transformed.mlir"
+                dump_llvm_path = self.dump_path / "llvm.mlir"
+            else:
+                dump_transformed_path = None
+                dump_llvm_path = None
+
+            lowered_module = Lower.lower_module(
+                module,
+                enable_transform_printing=False,
+                enable_llvm_printing=False,
+                dump_transformed_path=dump_transformed_path,
+                dump_llvm_path=dump_llvm_path,
+            )
+            cuda_func = Lower.prepare_kernel(
+                lowered_module,
+                shared_memory_usage=self.hint.smem_cost * self.pipeline_depth,
+            )
+        return cuda_func
+
+
 class Lower:
     @staticmethod
     def run_transform(module, enable_ir_printing=True):
@@ -506,8 +553,13 @@ def run_eval(
         print(dA @ dB)
         print(dC)
 
-    if profile:
-        return -1
+    with time_range("roller"):
+        cuda_func(
+            grid_dims,
+            block_dims,
+            (dA.data.ptr, dB.data.ptr, dC.data.ptr),
+            shared_mem=shared_memory_usage,
+        )
 
     for _ in range(10):
         cuda_func(
@@ -529,8 +581,9 @@ def run_eval(
 
     print(f"t={t_gpu / repeat_times:.6f} ms", end=" ")
     flops = 2 * M * N * K
-    print(f"GFLOPS={repeat_times*flops * 1e-9 / (t_gpu/1000):.6f}")
-    return t_gpu / repeat_times
+    gflops = repeat_times * flops * 1e-9 / (t_gpu / 1000)
+    print(f"GFLOPS={gflops:.6f}")
+    return t_gpu / repeat_times, gflops
 
 
 def run_baseline(config: MatmulConfig, repeat_times=50):
@@ -549,7 +602,9 @@ def run_baseline(config: MatmulConfig, repeat_times=50):
 
     print(f"t={t_gpu / repeat_times:.6f} ms", end=" ")
     flops = 2 * M * N * K
-    print(f"GFLOPS={repeat_times*flops * 1e-9 / (t_gpu/1000):.6f}")
+    gflops = repeat_times * flops * 1e-9 / (t_gpu / 1000)
+    print(f"GFLOPS={gflops:.6f}")
+    return t_gpu / repeat_times, gflops
 
 
 if __name__ == "__main__":
@@ -560,31 +615,19 @@ if __name__ == "__main__":
     run_baseline(config)
     result_dict = {}
     for hint in hints:
-        with mlir_mod_ctx() as ctx:
-            gb = GEMMBuilder()
-            gb.build_gemm(config.M, config.N, config.K)
-            gb.build_transform_pipeline(
-                hint.block_tile, hint.thread_tile, hint.rstep, pipeline_depth
-            )
-            module = ctx.module
-            lowered_module = Lower.lower_module(
-                module,
-                enable_transform_printing=False,
-                enable_llvm_printing=False,
-                dump_transformed_path=Path("log/transformed.mlir"),
-                dump_llvm_path=Path("log/llvm.mlir"),
-            )
-            cuda_func = Lower.prepare_kernel(
-                lowered_module, shared_memory_usage=hint.smem_cost * pipeline_depth
-            )
+        compiler = Compiler(config, hint, pipeline_depth, dump_path=Path("log"))
+        cuda_func = compiler.compile()
         print(hint)
-        t = run_eval(
+        t, gflops = run_eval(
             cuda_func,
             pipeline_depth,
             hint,
         )
         print("---\n")
-        result_dict[hint] = t
+        result_dict[hint] = (t, gflops)
 
-    best_hint = min(result_dict, key=result_dict.get)
-    print(f"Best hint: {best_hint}, time: {result_dict[best_hint]}")
+    if result_dict:
+        best_hint = min(result_dict, key=lambda x: result_dict[x][0])
+        print(
+            f"Best hint: {best_hint}, time: {result_dict[best_hint][0]}, GFLOPS: {result_dict[best_hint][1]}"
+        )
